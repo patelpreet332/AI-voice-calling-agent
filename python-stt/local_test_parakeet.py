@@ -1,12 +1,35 @@
 #!/usr/bin/env python3
 
-import os, sys, time, json, logging, threading, queue, collections
-import numpy as np
-import sounddevice as sd
-import webrtcvad
+import os
+# Suppress warnings and logger outputs for clean console output
+os.environ["NEMO_LOG_LEVEL"] = "ERROR"
+os.environ["HYDRA_FULL_ERROR"] = "0"
+
+import sys
+import time
+import json
+import logging
+import threading
+import queue
+import collections
+import wave
+import tempfile
+import warnings
 import requests
 from pathlib import Path
 from dotenv import load_dotenv
+
+# Set logging format like local_test.py
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+warnings.filterwarnings("ignore")
+log = logging.getLogger("VOICE")
+
+import numpy as np
+import sounddevice as sd
+import webrtcvad
+import torch
+from nemo.collections.asr.models import EncDecRNNTBPEModel
+from piper.voice import PiperVoice
 
 ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = ROOT.parent
@@ -21,11 +44,7 @@ MIN_SPEECH_SEC = 0.5
 SILENCE_SEC = 0.8
 MAX_AUDIO_SEC = 20
 
-INDIC_LANGS = {"hi", "gu", "te", "ta"}
-VALID_LANGS = {"en", "hi", "te", "ta", "gu"}
-
-FORCE_LANG = None
-
+FORCE_LANG = "en"
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
@@ -38,11 +57,6 @@ Use casual spoken tone.
 If unclear, ask short clarification.
 """
 
-logging.basicConfig(level=logging.INFO,
-    format="%(message)s")
-logging.getLogger("faster_whisper").setLevel(logging.WARNING)
-log = logging.getLogger("VOICE")
-
 audio_queue = queue.Queue()
 text_queue = queue.Queue()
 reply_queue = queue.Queue()
@@ -52,92 +66,67 @@ conversation_lock = threading.Lock()
 
 session = requests.Session()
 
-whisper_model = None
-indic_model = None
+model = None
 piper_voices = {}
 
-# ✅ NEW FLAG
 is_speaking = False
 
+def load_models():
+    global model, piper_voices
+    
+    log.info("[INIT] Loading Parakeet model...")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    log.info(f"[INIT] Using device: {device}")
+    model = EncDecRNNTBPEModel.from_pretrained(
+        model_name="nvidia/parakeet-tdt-0.6b-v3",
+        map_location=device
+    )
+    model.eval()
+    log.info("[INIT] Parakeet model loaded successfully!")
+
+    log.info("[INIT] Loading Piper TTS voice...")
+    voice_file = "en_US-lessac-medium.onnx"
+    path = PROJECT_ROOT / "piper" / voice_file
+    if path.exists():
+        piper_voices["en"] = PiperVoice.load(str(path))
+        log.info("[TTS] Loaded English voice (en_US-lessac-medium.onnx)")
+    else:
+        log.error(f"[TTS] Voice file not found: {path}")
 
 def warmup():
     log.info("[WARMUP] starting")
-
-    dummy = np.zeros(SAMPLE_RATE, dtype=np.float32)
-
-    if whisper_model:
-        whisper_model.transcribe(dummy)
-    if indic_model:
-        import torch
-        try:
-            indic_model(torch.zeros(1, SAMPLE_RATE), "hi")
-        except Exception as e:
-            log.warning(f"[WARMUP] Indic warmup failed: {e}")
-            
-    for lang, voice in piper_voices.items():
+    
+    # Warm up Piper TTS
+    voice = piper_voices.get("en")
+    if voice:
         try:
             for _ in voice.synthesize("hello"):
                 break
         except Exception as e:
-            log.warning(f"[WARMUP] TTS warmup failed for {lang}: {e}")
+            log.warning(f"[WARMUP] TTS warmup failed: {e}")
+            
+    # Warm up Parakeet STT
+    if model:
+        try:
+            # Create a tiny dummy wav file
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_wav:
+                temp_filename = temp_wav.name
+            try:
+                # 1 second of silence
+                dummy_audio = np.zeros(SAMPLE_RATE, dtype=np.int16)
+                with wave.open(temp_filename, 'wb') as wf:
+                    wf.setnchannels(CHANNELS)
+                    wf.setsampwidth(2)
+                    wf.setframerate(SAMPLE_RATE)
+                    wf.writeframes(dummy_audio.tobytes())
+                model.transcribe([temp_filename], batch_size=1)
+            finally:
+                if os.path.exists(temp_filename):
+                    os.remove(temp_filename)
+        except Exception as e:
+            log.warning(f"[WARMUP] STT warmup failed: {e}")
 
     log.info("[WARMUP] done")
-
-
-def load_models():
-    global whisper_model, indic_model, piper_voices
-
-    need_whisper = (not FORCE_LANG) or (FORCE_LANG == "en") or (FORCE_LANG not in INDIC_LANGS)
-    need_indic = (not FORCE_LANG) or (FORCE_LANG in INDIC_LANGS)
-
-    if need_whisper:
-        from faster_whisper import WhisperModel
-        import torch
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        model_size = "base" if device == "cpu" else "small"
-        compute_type = "float16" if device == "cuda" else "int8"
-        whisper_model = WhisperModel(model_size, device=device, compute_type=compute_type)
-        log.info(f"[INIT] Whisper ready (model: {model_size}, device: {device})")
-    else:
-        whisper_model = None
-        # log.info("[INIT] Whisper skipped (forced language does not require it)")
-
-    if need_indic:
-        try:
-            from transformers import AutoModel
-            indic_model = AutoModel.from_pretrained(
-                "ai4bharat/indic-conformer-600m-multilingual",
-                trust_remote_code=True
-            )
-            log.info("[INIT] Indic ready")
-        except Exception as e:
-            log.error(f"[INIT] Indic failed: {e}")
-            indic_model = None
-    else:
-        indic_model = None
-        # log.info("[INIT] Indic skipped (forced language does not require it)")
-
-    from piper.voice import PiperVoice
-
-    voices = {
-        "en": "en_US-lessac-medium.onnx",
-        "hi": "hi_IN-priyamvada-medium.onnx",
-        "te": "te_IN-padmavathi-medium.onnx",
-        "gu": "gu_epoch229.onnx",
-    }
-
-    # Filter voices if FORCE_LANG is specified
-    if FORCE_LANG:
-        voices = {FORCE_LANG: voices.get(FORCE_LANG)} if voices.get(FORCE_LANG) else {}
-
-    for lang, file in voices.items():
-        if not file:
-            continue
-        path = PROJECT_ROOT / "piper" / file
-        if path.exists():
-            piper_voices[lang] = PiperVoice.load(str(path))
-            log.info(f"[TTS] Loaded {lang}")
-
 
 vad = webrtcvad.Vad(VAD_MODE)
 
@@ -147,12 +136,11 @@ def is_speech(frame):
     except:
         return False
 
-
 def mic_worker():
     global is_speaking
 
     while True:
-        # ✅ BLOCK MIC WHEN TTS IS SPEAKING
+        # Block microphone input if TTS is currently speaking
         if is_speaking:
             time.sleep(0.05)
             continue
@@ -177,19 +165,24 @@ def mic_worker():
         log.info("🎤 Listening...")
 
         while True:
-            # ✅ STOP CAPTURING IF TTS STARTS MIDWAY
+            # Stop capturing immediately if TTS starts speaking mid-recording
             if is_speaking:
                 buffer = []
                 break
 
-            chunk, _ = stream.read(stream.blocksize)
+            try:
+                chunk, _ = stream.read(stream.blocksize)
+            except Exception as e:
+                log.error(f"[Mic Read Error] {e}")
+                break
+
             frame = chunk.tobytes()
             speech = is_speech(frame)
 
             if not recording_started:
                 if speech:
                     recording_started = True
-                    # Initialize buffer with pre-roll frames to capture the beginning of speech
+                    # Initialize buffer with pre-roll frames
                     for p_chunk in pre_roll:
                         buffer.extend(p_chunk)
                     buffer.extend(chunk.flatten())
@@ -228,69 +221,64 @@ def mic_worker():
         }
         audio_queue.put((audio, meta))
 
-
 def stt_worker():
     while True:
         audio, meta = audio_queue.get()
         start = time.time()
 
-        if FORCE_LANG:
-            lang = FORCE_LANG
+        # Convert back to int16 for WAV file writing
+        audio_int16 = (audio * 32768.0).astype(np.int16)
 
-            if lang in INDIC_LANGS and indic_model:
-                import torch
-                audio_tensor = torch.from_numpy(audio).float().unsqueeze(0)
-                with torch.no_grad():
-                    out = indic_model(audio_tensor, lang)
-                text = " ".join(out) if isinstance(out, list) else str(out)
-                engine = "indic"
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_wav:
+            temp_filename = temp_wav.name
 
-            else:
-                segments, _ = whisper_model.transcribe(
-                    audio,
-                    language=lang,
-                    beam_size=1,
-                    temperature=0.0
-                )
-                text = "".join(s.text for s in segments)
-                engine = "whisper"
+        try:
+            with wave.open(temp_filename, 'wb') as wf:
+                wf.setnchannels(CHANNELS)
+                wf.setsampwidth(2)
+                wf.setframerate(SAMPLE_RATE)
+                wf.writeframes(audio_int16.tobytes())
 
-        else:
-            segments, info = whisper_model.transcribe(
-                audio,
-                beam_size=1,
-                temperature=0.0
-            )
+            # Perform transcription using Parakeet (inherently optimized for English output)
+            result = model.transcribe([temp_filename], batch_size=1)
 
-            lang = info.language or "en"
-            if lang not in VALID_LANGS:
-                lang = "hi"
+            transcription = ""
+            if result:
+                if isinstance(result, tuple):
+                    texts = result[0]
+                else:
+                    texts = result
 
-            if lang in INDIC_LANGS and indic_model:
-                import torch
-                audio_tensor = torch.from_numpy(audio).float().unsqueeze(0)
-                with torch.no_grad():
-                    out = indic_model(audio_tensor, lang)
-                text = " ".join(out) if isinstance(out, list) else str(out)
-                engine = "indic"
-            else:
-                text = "".join(s.text for s in segments)
-                engine = "whisper"
+                if isinstance(texts, list) and len(texts) > 0:
+                    text_item = texts[0]
+                    if hasattr(text_item, 'text'):
+                        transcription = text_item.text
+                    else:
+                        transcription = str(text_item)
+                else:
+                    transcription = str(texts)
 
-        text = text.strip()
+            text = transcription.strip()
+            
+        except Exception as e:
+            log.error(f"[STT Error] {e}")
+            text = ""
+        finally:
+            if os.path.exists(temp_filename):
+                os.remove(temp_filename)
+            audio_queue.task_done()
 
         if not text or len(text) < 2:
             continue
 
         stt_duration = time.time() - start
         meta["stt_time"] = stt_duration
-        meta["stt_engine"] = engine
-        meta["stt_lang"] = lang
+        meta["stt_engine"] = "parakeet-tdt-0.6b-v3"
+        meta["stt_lang"] = "en"
         meta["text"] = text
 
-        log.info(f"\n[USER] {meta['speech_duration']:.2f}s speech → \"{text}\"")
-        text_queue.put((text, lang, meta))
-
+        log.info(f"\n🗣️ [USER] {meta['speech_duration']:.2f}s speech → \"{text}\"")
+        text_queue.put((text, "en", meta))
 
 def llm_worker():
     while True:
@@ -354,10 +342,10 @@ def llm_worker():
         meta["llm_total_time"] = llm_end - start
         meta["full_response"] = full
 
-        log.info(f"[ASSISTANT] (LLM total: {meta['llm_total_time']:.2f}s) → {full}")
+        log.info(f"🤖 [ASSISTANT] (LLM total: {meta['llm_total_time']:.2f}s) → {full}")
         with conversation_lock:
             conversation.append({"role": "assistant", "content": full})
-
+        text_queue.task_done()
 
 def tts_worker():
     global is_speaking
@@ -383,15 +371,11 @@ def tts_worker():
         if not should_flush:
             continue
 
-        voice = piper_voices.get(current_lang[:2])
-        if not voice:
-            # Fall back to any loaded voice if the target language voice is missing
-            voice = piper_voices.get("en") or piper_voices.get("hi") or next(iter(piper_voices.values()), None)
+        voice = piper_voices.get("en")
         if not voice:
             buffer = ""
             continue
 
-        # ✅ START SPEAKING
         is_speaking = True
 
         tts_synth_start = time.time()
@@ -420,18 +404,11 @@ def tts_worker():
             audio = np.frombuffer(chunk.audio_int16_bytes, dtype=np.int16)
             stream.write(audio)
 
-        # ✅ DONE SPEAKING
         is_speaking = False
-
         buffer = ""
-
+        reply_queue.task_done()
 
 def main():
-    global FORCE_LANG
-
-    if len(sys.argv) > 1:
-        FORCE_LANG = sys.argv[1]
-
     load_models()
     warmup()
 
@@ -440,9 +417,12 @@ def main():
     threading.Thread(target=llm_worker, daemon=True).start()
     threading.Thread(target=tts_worker, daemon=True).start()
 
-    while True:
-        time.sleep(1)
-
+    log.info("\n🟢 System active! Start speaking now...")
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        log.info("\n👋 Exiting...")
 
 if __name__ == "__main__":
     main()

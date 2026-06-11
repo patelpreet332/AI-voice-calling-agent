@@ -21,9 +21,11 @@ __pycache__/
 # Virtual environments
 .venv/
 venv/
+nemo_env
 venv*/
 python-stt/venv/
 python-stt/venvnsource/
+python-stt/data
 
 # Piper TTS models (download separately)
 piper/
