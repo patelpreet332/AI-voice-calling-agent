@@ -254,6 +254,8 @@ This triggers an outbound call from `TWILIO_PHONE_NUMBER` → `USER_PHONE_NUMBER
 
 No Twilio or Node server required.
 
+#### Option A: Default Flow (Whisper / IndicConformer)
+
 1) From the **project root**, configure `.env`:
 
 ```bash
@@ -276,6 +278,43 @@ Optional — force a specific language:
 
 ```bash
 python3 local_test.py hi
+```
+
+#### Option B: NVIDIA Parakeet Flow (English-only STT)
+
+The Parakeet flow uses `nvidia/parakeet-tdt-0.6b-v3` for high-accuracy, low-latency English speech-to-text. Since NVIDIA NeMo has specific package requirements (such as PyTorch and ASR toolkit dependencies), we run it in a separate virtual environment (`nemo_env`) to avoid package conflicts.
+
+1) Create and activate `nemo_env`:
+
+From the `python-stt/` folder:
+
+```bash
+cd python-stt
+python3 -m venv nemo_env
+source nemo_env/bin/activate
+pip install -U pip setuptools wheel
+```
+
+2) Install PyTorch, NeMo ASR, and other dependencies:
+
+```bash
+pip install torch torchaudio
+pip install "nemo_toolkit[asr]"
+pip install sounddevice webrtcvad-wheels piper-tts python-dotenv requests numpy
+```
+
+*(Note: Cython may be compiled during NeMo installation. Ensure you have compiler tools installed on your OS, e.g., `sudo apt-get install build-essential` on Ubuntu).*
+
+3) Configure Environment & Piper Voices:
+- Verify that `.env` in the project root contains your `GROQ_API_KEY`.
+- Ensure the English voice `en_US-lessac-medium.onnx` and its config file are downloaded into the `piper/` folder (see step 4 under Phone Call Flow).
+
+4) Run the Parakeet Local Mic Flow:
+
+With `nemo_env` active:
+
+```bash
+python3 local_test_parakeet.py
 ```
 
 ## Environment Variables
